@@ -1,3 +1,4 @@
-log.txt
 node_modules
-log-app.txt
+dist
+*.js.map
+.claude
