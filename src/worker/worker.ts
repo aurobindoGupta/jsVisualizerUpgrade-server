@@ -17,6 +17,27 @@ const traverse = (_traverse as unknown as { default: typeof _traverse }).default
 const generate = (_generate as unknown as { default: typeof _generate }).default ?? _generate;
 
 // ---------------------------------------------------------------------------
+// Optional process binding for promise introspection.
+// process.binding('util').getPromiseDetails exists in Node <=18 but was
+// removed in later versions. We cache it once at startup; if unavailable
+// the resolvedValue feature silently degrades.
+// ---------------------------------------------------------------------------
+
+type PromiseDetails = [state: number, value: unknown];
+let getPromiseDetails: ((p: unknown) => PromiseDetails) | undefined;
+try {
+  // process.binding is an undocumented Node.js internal — cast through unknown to access it.
+  const nodeProcess = process as unknown as { binding?: (name: string) => Record<string, unknown> };
+  const utilBinding = nodeProcess.binding?.('util');
+  const fn = utilBinding?.['getPromiseDetails'];
+  if (typeof fn === 'function') {
+    getPromiseDetails = fn as (p: unknown) => PromiseDetails;
+  }
+} catch {
+  // process.binding is deprecated; gracefully degrade if unavailable
+}
+
+// ---------------------------------------------------------------------------
 // Event helpers
 // ---------------------------------------------------------------------------
 
@@ -37,12 +58,15 @@ const Events = {
   ErrorFunction: (message: string, id: number, name: string, start: number, end: number) =>
     makeEvent('ErrorFunction', { message, id, name, start, end }),
 
-  InitPromise: (id: number, parentId: number) => makeEvent('InitPromise', { id, parentId }),
-  ResolvePromise: (id: number) => makeEvent('ResolvePromise', { id }),
+  InitPromise: (id: number, parentId: number, label: string) =>
+    makeEvent('InitPromise', { id, parentId, label }),
+  ResolvePromise: (id: number, resolvedValue?: string) =>
+    makeEvent('ResolvePromise', { id, ...(resolvedValue !== undefined ? { resolvedValue } : {}) }),
   BeforePromise: (id: number) => makeEvent('BeforePromise', { id }),
   AfterPromise: (id: number) => makeEvent('AfterPromise', { id }),
 
-  InitMicrotask: (id: number, parentId: number) => makeEvent('InitMicrotask', { id, parentId }),
+  InitMicrotask: (id: number, parentId: number, label: string) =>
+    makeEvent('InitMicrotask', { id, parentId, label }),
   BeforeMicrotask: (id: number) => makeEvent('BeforeMicrotask', { id }),
   AfterMicrotask: (id: number) => makeEvent('AfterMicrotask', { id }),
 
@@ -80,33 +104,85 @@ const IGNORED_HOOK_TYPES = new Set([
   'QUERYWRAP', 'SHUTDOWNWRAP', 'SIGNALWRAP', 'STATWATCHER', 'TCPCONNECTWRAP',
   'TCPSERVERWRAP', 'TCPWRAP', 'TTYWRAP', 'UDPSENDWRAP', 'UDPWRAP', 'WRITEWRAP',
   'ZLIB', 'SSLCONNECTION', 'PBKDF2REQUEST', 'RANDOMBYTESREQUEST', 'TLSWRAP',
-  'DNSCHANNEL',
+  'DNSCHANNEL', 'TickObject',
 ]);
+
+// ---------------------------------------------------------------------------
+// Internal hard timeout — created BEFORE the hook is enabled so it is never
+// tracked as an async resource in the visualizer. .unref() prevents the
+// timer from keeping the worker alive if everything else has finished.
+// ---------------------------------------------------------------------------
+
+const START_TIME = Date.now();
+const TIMEOUT_MILLIS = 5000;
+
+setTimeout(() => {
+  postEvent(Events.EarlyTermination(`Terminated early: Timeout of ${TIMEOUT_MILLIS}ms exceeded.`));
+  process.exit(1);
+}, TIMEOUT_MILLIS).unref();
 
 // ---------------------------------------------------------------------------
 // Async hooks — track async resource types by asyncId so we can identify them
 // in before/after/promiseResolve without relying on resource.constructor.name.
+// ROOT_ASYNC_ID captures the worker module's CJS execution context — this is
+// the triggerAsyncId for all top-level user async resources created in the VM.
 // ---------------------------------------------------------------------------
+
+const ROOT_ASYNC_ID = asyncHooks.executionAsyncId();
 
 const asyncIdToType: Record<number, string> = {};
 const asyncIdToResource: Record<number, { _onTimeout?: { name?: string }; promise?: unknown }> = {};
 
+// ---------------------------------------------------------------------------
+// Stack-trace label helper — extracts the user-code line from the call stack
+// by finding the VM context frame (evalmachine.<anonymous>:N:N).
+// Falls back to the provided string if no VM frame is found (e.g. for async
+// resources created by Node internals rather than user code).
+// ---------------------------------------------------------------------------
+
+const getCreationLabel = (fallback: string): string => {
+  const stack = new Error().stack ?? '';
+  const lines = stack.split('\n');
+  const vmFrame = lines.find((l) => l.includes('evalmachine.<anonymous>:'));
+  if (!vmFrame) return fallback;
+  const match = vmFrame.match(/evalmachine\.<anonymous>:(\d+):\d+/);
+  if (!match) return fallback;
+  return `Callback at line ${match[1]}`;
+};
+
 const init = (asyncId: number, type: string, triggerAsyncId: number, resource: unknown): void => {
+  // Guard 1: ignore infrastructure noise types
   if (IGNORED_HOOK_TYPES.has(type)) return;
 
-  asyncIdToType[asyncId] = type;
-  asyncIdToResource[asyncId] = resource as typeof asyncIdToResource[number];
+  // Guard 2: skip children of untracked/infrastructure parents.
+  // ROOT_ASYNC_ID is the worker module's CJS execution context (the parent of
+  // all top-level user async resources). Anything else with an untracked parent
+  // is an infra child (e.g. TCP connections spawned internally by fetch).
+  if (triggerAsyncId !== ROOT_ASYNC_ID && asyncIdToType[triggerAsyncId] === undefined) return;
 
   if (type === 'PROMISE') {
-    postEvent(Events.InitPromise(asyncId, triggerAsyncId));
+    asyncIdToType[asyncId] = type;
+    asyncIdToResource[asyncId] = resource as typeof asyncIdToResource[number];
+    const label = getCreationLabel('Promise Reaction');
+    postEvent(Events.InitPromise(asyncId, triggerAsyncId, label));
   }
+
   if (type === 'Timeout') {
-    const res = resource as { _onTimeout?: { name?: string } };
-    const callbackName = res._onTimeout?.name ?? 'anonymous';
+    const res = resource as { _onTimeout?: { name?: string }; hasRef?: () => boolean };
+    // Guard 3: exclude unref'd timers (e.g. undici/fetch keepalive timers that
+    // call .unref() immediately after construction, and our own internal kill timer).
+    if (typeof res.hasRef === 'function' && !res.hasRef()) return;
+    asyncIdToType[asyncId] = type;
+    asyncIdToResource[asyncId] = resource as typeof asyncIdToResource[number];
+    const callbackName = res._onTimeout?.name || getCreationLabel('Async Callback');
     postEvent(Events.InitTimeout(asyncId, callbackName));
   }
+
   if (type === 'Microtask') {
-    postEvent(Events.InitMicrotask(asyncId, triggerAsyncId));
+    asyncIdToType[asyncId] = type;
+    asyncIdToResource[asyncId] = resource as typeof asyncIdToResource[number];
+    const label = getCreationLabel('Async Callback');
+    postEvent(Events.InitMicrotask(asyncId, triggerAsyncId, label));
   }
 };
 
@@ -131,8 +207,21 @@ const destroy = (asyncId: number): void => {
 };
 
 const promiseResolve = (asyncId: number): void => {
-  if (asyncIdToResource[asyncId] !== undefined) {
-    postEvent(Events.ResolvePromise(asyncId));
+  const resource = asyncIdToResource[asyncId];
+  if (resource !== undefined) {
+    let resolvedValue: string | undefined;
+    if (getPromiseDetails !== undefined && resource.promise != null) {
+      try {
+        const [state, value] = getPromiseDetails(resource.promise);
+        // state === 1 means fulfilled (0 = pending, 2 = rejected)
+        if (state === 1 && value !== undefined && value !== null) {
+          resolvedValue = prettyFormat(value);
+        }
+      } catch {
+        // Graceful degradation if V8 introspection fails
+      }
+    }
+    postEvent(Events.ResolvePromise(asyncId, resolvedValue));
   }
 };
 
@@ -260,8 +349,6 @@ const instrumentLoops = (sourceCode: string): string => {
 // Tracer — functions injected into the vm sandbox
 // ---------------------------------------------------------------------------
 
-const START_TIME = Date.now();
-const TIMEOUT_MILLIS = 5000;
 const EVENT_LIMIT = 500;
 const VM_TIMEOUT_MS = 6000;
 
@@ -300,15 +387,6 @@ const Tracer = {
     }
   },
 };
-
-// ---------------------------------------------------------------------------
-// Internal hard timeout — posts EarlyTermination and exits if async code hangs
-// ---------------------------------------------------------------------------
-
-setTimeout(() => {
-  postEvent(Events.EarlyTermination(`Terminated early: Timeout of ${TIMEOUT_MILLIS}ms exceeded.`));
-  process.exit(1);
-}, TIMEOUT_MILLIS);
 
 // ---------------------------------------------------------------------------
 // Uncaught exception handler (e.g. call stack overflow)
@@ -350,7 +428,7 @@ const sandbox = {
   },
 };
 
-const context = vm.createContext(sandbox);
+const context = vm.createContext(sandbox, { microtaskMode: 'afterEvaluate' });
 
 try {
   vm.runInContext(modifiedSource, context, { timeout: VM_TIMEOUT_MS });

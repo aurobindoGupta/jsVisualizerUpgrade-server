@@ -65,3 +65,25 @@ Full refactor from plain JavaScript (Node 11) to TypeScript + Express (Node 18 L
 29. **Renamed project** from `js-visualizer-9000` to `js-visualizer-10000` across `package.json` and `README.md`.
 
 30. **Rewrote `README.md`** — documents the new stack (Node 18+, TypeScript, Express), setup and run instructions (`npm run dev`, `npm run build`, `npm start`), the WebSocket URL for the frontend (`ws://localhost:8080`), the health check endpoint, environment variables, the event protocol, a worked example, and the two-layer timeout/safeguard architecture.
+
+---
+
+## async_hooks Tracer Improvements — Noise Filtering & Anonymous Naming
+
+31. **Blacklisted `TickObject` resource type** (`src/worker/worker.ts`) — added to `IGNORED_HOOK_TYPES`. `TickObject` resources are created by `process.nextTick`, which is not exposed in the VM sandbox, so these are always CJS module-loader noise and should never appear in the visualizer.
+
+32. **Fixed internal kill timer leaking into the event stream** (`src/worker/worker.ts`) — the worker's internal 5 s hard-kill `setTimeout` was created *after* `asyncHooks.createHook(...).enable()`, causing its `init` hook to fire and produce a spurious `InitTimeout` event. The timer is now created *before* the hook is enabled (so `init` never fires for it) and `.unref()` is chained on the return value as a belt-and-suspenders measure.
+
+33. **Added trigger-based parent filter to `init` hook** (`src/worker/worker.ts`) — resources whose `triggerAsyncId` is neither the worker's root execution context nor an already-tracked resource are now silently dropped. This eliminates children of blacklisted infrastructure handles (e.g. TCP connections or HTTP parser resources spawned internally by `fetch`/undici) from reaching the event stream. `ROOT_ASYNC_ID` is captured dynamically via `asyncHooks.executionAsyncId()` rather than hardcoded to `1`, because in a CJS worker thread the root context ID is assigned by the module loader (not always `1`).
+
+34. **Added `hasRef()` guard for `Timeout` resources** (`src/worker/worker.ts`) — fetch/undici keepalive timers call `.unref()` immediately after construction. The `init` hook now checks `resource.hasRef()` and skips any Timeout resource that returns `false`, preventing internal library timers from appearing as `InitTimeout` events. The `asyncIdToType` / `asyncIdToResource` map writes are moved inside each type-specific branch so that an early-return from the `hasRef()` guard does not leave stale entries.
+
+35. **Added `getCreationLabel` stack-trace helper** (`src/worker/worker.ts`) — a new helper function walks the current call stack at the moment an async resource is created, looking for a VM context frame (`evalmachine.<anonymous>:N:N`). If found, it returns `'Callback at line N'`; otherwise it returns a semantic fallback (`'Promise Reaction'` or `'Async Callback'`). This label is attached to every `InitPromise`, `InitMicrotask`, and anonymous `InitTimeout` event.
+
+36. **Added `label` field to `InitPromise` and `InitMicrotask` events** (`src/worker/worker.ts`) — both events now carry a human-readable `label` string in their payload. Named callbacks already carry their function name; this field gives anonymous ones a meaningful source-location tag (e.g. `'Callback at line 5'`) instead of a blank box.
+
+37. **Captured resolved Promise value in `promiseResolve` hook** (`src/worker/worker.ts`) — uses `process.binding('util').getPromiseDetails` (accessed via a type-safe `unknown` cast, cached at worker startup behind a `try/catch`) to synchronously inspect the fulfilled value of a Promise at the moment it resolves. If the state is fulfilled and the value is non-null, it is serialized with `prettyFormat` and included as `resolvedValue` in the `ResolvePromise` event payload. Degrades silently on Node 20+ where the internal binding was removed.
+
+38. **Set `microtaskMode: 'afterEvaluate'` on the VM context** (`src/worker/worker.ts`) — `vm.createContext` now receives `{ microtaskMode: 'afterEvaluate' }` as its second argument. This causes the VM to flush all pending microtasks (Promise `.then()` callbacks, `queueMicrotask`) immediately after `runInContext` returns, ensuring that `BeforePromise` / `AfterPromise` async hook events are emitted and captured before the worker finishes, rather than being deferred to a later event-loop tick.
+
+39. **Added anonymous-name label fallback in `eventsReducer`** (`src/main/eventsReducer.ts`) — `reduceEvents` now builds an `asyncIdToLabel` lookup from all `InitPromise` and `InitMicrotask` events. When constructing `EnqueueMicrotask` events, if the traced function name is `'anonymous'`, the reducer substitutes the corresponding label from the lookup (e.g. `'Callback at line 5'`), falling back to `'Promise Reaction'` or `'Async Callback'`. Named callbacks are unaffected.

@@ -87,6 +87,15 @@ export const reduceEvents = (events: ExecutionEvent[]): ExecutionEvent[] => {
   });
   events = dedupedReverse.reverse();
 
+  // Build a label lookup from asyncId to the label captured at resource creation
+  // (e.g. 'Callback at line 5'). Used to substitute better names for anonymous callbacks.
+  const asyncIdToLabel: Record<number, string> = {};
+  events
+    .filter(({ type }) => type === 'InitPromise' || type === 'InitMicrotask')
+    .forEach(({ payload: { id, label } }) => {
+      if (typeof label === 'string') asyncIdToLabel[id as number] = label;
+    });
+
   // Determine when Microtasks were enqueued.
   // A Microtask was enqueued when its parent resolved iff the child Promise of the
   // parent had its callback invoked.
@@ -106,10 +115,15 @@ export const reduceEvents = (events: ExecutionEvent[]): ExecutionEvent[] => {
         : undefined,
     )
     .filter((pair): pair is [ExecutionEvent, ExecutionEvent] => pair !== undefined)
-    .map(([beforePromiseEvt, enterFunctionEvt]) => ({
-      id: beforePromiseEvt.payload.id as number,
-      name: enterFunctionEvt.payload.name as string,
-    }));
+    .map(([beforePromiseEvt, enterFunctionEvt]) => {
+      const childId = beforePromiseEvt.payload.id as number;
+      const tracedName = enterFunctionEvt.payload.name as string;
+      const name =
+        tracedName === 'anonymous'
+          ? (asyncIdToLabel[childId] ?? 'Promise Reaction')
+          : tracedName;
+      return { id: childId, name };
+    });
 
   const promiseChildIdToParentId: Record<number, number> = {};
   events
@@ -144,10 +158,15 @@ export const reduceEvents = (events: ExecutionEvent[]): ExecutionEvent[] => {
         : undefined,
     )
     .filter((pair): pair is [ExecutionEvent, ExecutionEvent] => pair !== undefined)
-    .map(([beforeMicrotaskEvt, enterFunctionEvt]) => ({
-      id: beforeMicrotaskEvt.payload.id as number,
-      name: enterFunctionEvt.payload.name as string,
-    }));
+    .map(([beforeMicrotaskEvt, enterFunctionEvt]) => {
+      const childId = beforeMicrotaskEvt.payload.id as number;
+      const tracedName = enterFunctionEvt.payload.name as string;
+      const name =
+        tracedName === 'anonymous'
+          ? (asyncIdToLabel[childId] ?? 'Async Callback')
+          : tracedName;
+      return { id: childId, name };
+    });
 
   const microtaskChildIdToParentId: Record<number, number> = {};
   events
