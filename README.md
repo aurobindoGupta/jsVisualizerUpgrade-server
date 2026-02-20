@@ -1,8 +1,8 @@
 # JavaScript Visualizer 10000 — Server
 
-Backend WebSocket server for [js-visualizer-10000](https://jsv9000.app). Executes user-submitted JavaScript in an isolated worker thread, instruments the code for tracing, and streams execution events to the frontend client.
+Backend WebSocket server for [js-visualizer-10000](https://js-visualizer-upgrade-git-main-aurobindo-guptas-projects.vercel.app/). Executes user-submitted JavaScript in an isolated worker thread, instruments the code for tracing, and streams execution events to the frontend client.
 
-The companion frontend repo is [js-visualizer-10000-client](https://github.com/Hopding/js-visualizer-9000-client).
+The companion frontend repo is [js-visualizer-10000-client](https://github.com/aurobindoGupta/jsVisualizerUpgrade).
 
 ---
 
@@ -69,7 +69,7 @@ Connect the frontend WebSocket client to:
 | Local development | `ws://localhost:8080` |
 | Production (Heroku / Railway / etc.) | `wss://<your-deployed-hostname>` |
 
-The [js-visualizer-10000-client](https://github.com/Hopding/js-visualizer-9000-client) defaults to `ws://localhost:8080` in development. Update its `SERVER_URL` environment variable when deploying to production.
+The [js-visualizer-10000-client](https://github.com/aurobindoGupta/jsVisualizerUpgrade) defaults to `ws://localhost:8080` in development. Update its `SERVER_URL` environment variable when deploying to production.
 
 ---
 
