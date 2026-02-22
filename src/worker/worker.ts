@@ -107,6 +107,13 @@ const IGNORED_HOOK_TYPES = new Set([
   'DNSCHANNEL', 'TickObject',
 ]);
 
+// Internal Node.js/undici timer callback names that should never appear in the visualizer.
+const IGNORED_CALLBACK_NAMES = new Set([
+  'onTimeout',     // Node.js internal generic timer handler
+  'listOnTimeout', // Node.js internal timer list processor
+  'processTimers', // Node.js internal timer tick
+]);
+
 // ---------------------------------------------------------------------------
 // Internal hard timeout — created BEFORE the hook is enabled so it is never
 // tracked as an async resource in the visualizer. .unref() prevents the
@@ -172,9 +179,12 @@ const init = (asyncId: number, type: string, triggerAsyncId: number, resource: u
     // Guard 3: exclude unref'd timers (e.g. undici/fetch keepalive timers that
     // call .unref() immediately after construction, and our own internal kill timer).
     if (typeof res.hasRef === 'function' && !res.hasRef()) return;
+    // Guard 4: exclude timers whose callback is a known Node.js/undici internal name.
+    const cbName = res._onTimeout?.name ?? '';
+    if (IGNORED_CALLBACK_NAMES.has(cbName)) return;
     asyncIdToType[asyncId] = type;
     asyncIdToResource[asyncId] = resource as typeof asyncIdToResource[number];
-    const callbackName = res._onTimeout?.name || getCreationLabel('Async Callback');
+    const callbackName = cbName || getCreationLabel('Async Callback');
     postEvent(Events.InitTimeout(asyncId, callbackName));
   }
 
