@@ -114,6 +114,12 @@ const IGNORED_CALLBACK_NAMES = new Set([
   'processTimers', // Node.js internal timer tick
 ]);
 
+// Flag that is true only while the sandboxed setTimeout wrapper is executing.
+// Because async hook init() fires synchronously inside setTimeout(), this lets
+// us distinguish timers explicitly created by user code from internal timers
+// created by undici/fetch (which call Node's global setTimeout directly).
+let inUserSetTimeout = false;
+
 // ---------------------------------------------------------------------------
 // Internal hard timeout — created BEFORE the hook is enabled so it is never
 // tracked as an async resource in the visualizer. .unref() prevents the
@@ -182,6 +188,10 @@ const init = (asyncId: number, type: string, triggerAsyncId: number, resource: u
     // Guard 4: exclude timers whose callback is a known Node.js/undici internal name.
     const cbName = res._onTimeout?.name ?? '';
     if (IGNORED_CALLBACK_NAMES.has(cbName)) return;
+    // Guard 5: only track timers created through the sandboxed setTimeout.
+    // undici/fetch call Node's global setTimeout directly, so inUserSetTimeout
+    // will be false for all internal timers regardless of their callback name.
+    if (!inUserSetTimeout) return;
     asyncIdToType[asyncId] = type;
     asyncIdToResource[asyncId] = resource as typeof asyncIdToResource[number];
     const callbackName = cbName || getCreationLabel('Async Callback');
@@ -422,13 +432,27 @@ try {
   process.exit(1);
 }
 
+// Wrap setTimeout so the async hook can tell user-created timers apart from
+// internal ones. The flag is set synchronously around the real call, and
+// init() fires synchronously inside it, so the guard is reliable.
+const sandboxSetTimeout = (
+  fn: (...args: unknown[]) => void,
+  delay?: number,
+  ...args: unknown[]
+): ReturnType<typeof setTimeout> => {
+  inUserSetTimeout = true;
+  const timer = setTimeout(fn as () => void, delay, ...args);
+  inUserSetTimeout = false;
+  return timer;
+};
+
 const sandbox = {
   nextId,
   Tracer,
   fetch,
   _,
   lodash: _,
-  setTimeout,
+  setTimeout: sandboxSetTimeout,
   queueMicrotask,
   Promise,
   console: {
