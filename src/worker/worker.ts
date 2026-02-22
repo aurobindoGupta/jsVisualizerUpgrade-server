@@ -436,12 +436,12 @@ try {
 // internal ones. The flag is set synchronously around the real call, and
 // init() fires synchronously inside it, so the guard is reliable.
 const sandboxSetTimeout = (
-  fn: (...args: unknown[]) => void,
+  fn: (...args: any[]) => void,
   delay?: number,
-  ...args: unknown[]
+  ...args: any[]
 ): ReturnType<typeof setTimeout> => {
   inUserSetTimeout = true;
-  const timer = setTimeout(fn as () => void, delay, ...args);
+  const timer = setTimeout(fn, delay, ...args);
   inUserSetTimeout = false;
   return timer;
 };
